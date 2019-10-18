@@ -56,6 +56,9 @@
 #include <rte_ip_frag.h>
 #include <rte_eth_bond.h>
 #include "mbuf.h"
+#ifdef CONFIG_DPVS_PDUMP
+#include <rte_pdump.h>
+#endif
 
 typedef uint8_t lcoreid_t;
 typedef uint16_t portid_t;
