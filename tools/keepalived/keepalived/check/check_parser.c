@@ -465,6 +465,47 @@ hash_target_handler(vector_t *strvec)
 	}
 }
 
+static void
+rs_alive_ratio_lower_handler(vector_t * strvec)
+{
+	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
+	vs->rs_aratio_lower_limit = atoi(vector_slot(strvec, 1));
+
+	/* rs_alive_ratio_lower_limit in [0,100], default: 0 */
+	if (vs->rs_aratio_lower_limit > 100) {
+		vs->rs_aratio_lower_limit = 100;
+	}
+	else if (vs->rs_aratio_lower_limit >= 0) {
+		vs->rs_aratio_lower_limit = vs->rs_aratio_lower_limit;
+	}
+	else {
+		vs->rs_aratio_lower_limit = DEFAULT_RS_ARATIO_LOWER_LIMIT;
+	}
+}
+
+static void
+rs_alive_ratio_upper_handler(vector_t * strvec)
+{
+	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
+	vs->rs_aratio_upper_limit = atoi(vector_slot(strvec, 1));;
+
+	/* rs_alive_ratio_upper_limit in [0,100], default: 100 */
+	if (vs->rs_aratio_upper_limit > 100) {
+		vs->rs_aratio_upper_limit = 100;
+	} else if (vs->rs_aratio_upper_limit >= 0) {
+		vs->rs_aratio_upper_limit = vs->rs_aratio_upper_limit;
+	} else {
+		vs->rs_aratio_upper_limit = DEFAULT_RS_ARATIO_UPPER_LIMIT;
+	}
+}
+
+static void
+rs_alive_ratio_action_handler(vector_t *strvec)
+{
+	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
+	vs->rs_aratio_action = set_value(strvec);
+}
+
 vector_t *
 check_init_keywords(void)
 {
@@ -516,6 +557,9 @@ check_init_keywords(void)
 	install_keyword("oif", &oif_handler);
 	install_keyword("iif", &iif_handler);
 	install_keyword("hash_target", &hash_target_handler);
+	install_keyword("rs_alive_ratio_upper_limit", &rs_alive_ratio_upper_handler);
+	install_keyword("rs_alive_ratio_lower_limit", &rs_alive_ratio_lower_handler);
+	install_keyword("rs_alive_ratio_action", &rs_alive_ratio_action_handler);
 
 	/* Pool regression detection and handling. */
 	install_keyword("alpha", &alpha_handler);

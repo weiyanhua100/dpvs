@@ -46,6 +46,7 @@
 #include "list.h"
 #include "vector.h"
 #include "timer.h"
+#include "scheduler.h"
 
 /* Typedefs */
 typedef unsigned int checker_id_t;
@@ -55,6 +56,10 @@ typedef unsigned int checker_id_t;
 #define MAX_BPS_LENGTH			5
 #define MAX_LIMIT_PROPORTION_LENGTH     5
 #define KEEPALIVED_DEFAULT_DELAY	(60 * TIMER_HZ) 
+
+#define DEFAULT_RS_ARATIO_UPPER_LIMIT 100
+#define DEFAULT_RS_ARATIO_LOWER_LIMIT 0
+#define RS_ARATIO_REACH_LOWER_LIMIT (0x01)
 
 /* SSL specific data */
 typedef struct _ssl_data {
@@ -188,6 +193,12 @@ typedef struct _virtual_server {
 	char				iifname[IFNAMSIZ];
 	char				oifname[IFNAMSIZ];
 	unsigned			hash_target;
+	int				rs_alive_count;
+	int				rs_aratio_lower_limit;
+	int				rs_aratio_upper_limit;
+	int				flag;
+	char				*rs_aratio_action;
+	thread_t			*rs_upper_limit_thread;
 #if defined(_WITH_SNMP_) && defined(_KRNL_2_6_) && defined(_WITH_LVS_)
 	/* Statistics */
 	time_t				lastupdated;
@@ -297,7 +308,12 @@ static inline int inaddr_equal(sa_family_t family, void *addr1, void *addr2)
 			 !strcmp((X)->srange, (Y)->srange)				&&\
 			 !strcmp((X)->drange, (Y)->drange)				&&\
 			 !strcmp((X)->iifname, (Y)->iifname)				&&\
-			 !strcmp((X)->oifname, (Y)->oifname))
+			 !strcmp((X)->oifname, (Y)->oifname))            &&\
+			 (X)->rs_aratio_upper_limit == (Y)->rs_aratio_upper_limit		&&\
+			 (X)->rs_aratio_lower_limit == (Y)->rs_aratio_lower_limit		&&\
+			 ((!(X)->rs_aratio_action && !(Y)->rs_aratio_action) || \
+			    ((X)->rs_aratio_action && (Y)->rs_aratio_action && !strcmp ((X)->rs_aratio_action, (Y)->rs_aratio_action)) \
+			 )
 
 #define VSGE_ISEQ(X,Y)	(sockstorage_equal(&(X)->addr,&(Y)->addr) &&	\
 			 (X)->range     == (Y)->range &&		\

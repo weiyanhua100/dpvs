@@ -310,6 +310,7 @@ free_vs(void *data)
 	FREE_PTR(vs->local_addr_gname);
 	FREE_PTR(vs->blklst_addr_gname);
 	FREE_PTR(vs->vip_bind_dev);
+	FREE_PTR(vs->rs_aratio_action);
 	FREE(vs);
 }
 static void
@@ -391,6 +392,12 @@ dump_vs(void *data)
 		break;
 	}
 
+	if (vs->rs_aratio_action) {
+		log_message(LOG_INFO, "   rs_aratio_action = %s", vs->rs_aratio_action);
+		log_message(LOG_INFO, "   rs_aratio_lower_limit = %d", vs->rs_aratio_lower_limit);
+		log_message(LOG_INFO, "   rs_aratio_upper_limit = %d", vs->rs_aratio_upper_limit);
+	}
+
 	if (vs->s_svr) {
 		log_message(LOG_INFO, "   sorry server = %s"
 				    , FMT_RS(vs->s_svr));
@@ -442,6 +449,11 @@ alloc_vs(char *ip, char *port)
 	new->blklst_addr_gname = NULL;
 	new->vip_bind_dev = NULL;
 	new->hash_target = 0;
+	new->rs_alive_count = 0;
+	new->rs_aratio_lower_limit = 0;
+	new->rs_aratio_upper_limit = 0;
+	new->rs_aratio_action = NULL;
+	new->rs_upper_limit_thread = NULL;
 	memset(new->srange, 0, 256);
 	memset(new->drange, 0, 256);
 	memset(new->iifname, 0, IFNAMSIZ);
@@ -513,6 +525,7 @@ alloc_rs(char *ip, char *port)
 	if (LIST_ISEMPTY(vs->rs))
 		vs->rs = alloc_list(free_rs, dump_rs);
 	list_add(vs->rs, new);
+	vs->rs_alive_count++;
 }
 
 static void
