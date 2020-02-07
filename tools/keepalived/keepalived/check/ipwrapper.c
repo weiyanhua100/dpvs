@@ -564,6 +564,361 @@ update_quorum_state(virtual_server_t * vs, bool init)
 	}
 }
 
+static int
+rs_aratio_action_exec(char *cmd)
+{
+	pid_t pid;
+	int retval;
+
+	pid = fork();
+
+	/* In case of fork is error. */
+	if (pid < 0) {
+		syslog(LOG_INFO, "Failed fork process");
+		return -1;
+	}
+
+	/* In case of this is parent process */
+	if (pid)
+		return 0;
+
+	retval = system(cmd);
+	if (retval == 127) {
+		/* couldn't exec command */
+		syslog(LOG_ALERT, "Couldn't exec command: %s", cmd);
+	} else if (retval == -1) {
+		/* other error */
+		syslog(LOG_ALERT, "Error exec-ing command: %s", cmd);
+	}
+
+	exit(0);
+}
+
+static int rs_aratio_action_addr(int limit, virtual_server_t *vs,
+                                            struct sockaddr_storage *addr)
+{
+    char buf[512];
+    if (vs->rs_aratio_action) {
+        memset(buf, 0, sizeof(buf));
+        snprintf(buf, sizeof(buf), "%s %s %s",
+            vs->rs_aratio_action, inet_sockaddrtos(addr), limit ? "upper" : "lower");
+        log_message(LOG_INFO, "rs_aratio_action %s\n", buf);
+        rs_aratio_action_exec(buf);
+    }
+
+    return 1;
+}
+
+static int rs_aratio_action_group_range(int limit, virtual_server_t *vs,
+											virtual_server_group_entry_t *vsg_entry)
+{
+	uint32_t addr_ip, ip;
+	struct sockaddr_storage vip_addr;
+
+	vip_addr = vsg_entry->addr;
+	if (vsg_entry->addr.ss_family == AF_INET6) {
+		//inet_sockaddrip6(&vsg_entry->addr, &addr.in6);
+		ip = ((struct sockaddr_in6*)&vip_addr)->sin6_addr.s6_addr32[3];
+	} else {
+		ip = ((struct sockaddr_in*)&vip_addr)->sin_addr.s_addr;
+	}
+
+	/* Parse the whole range */
+	for (addr_ip = ip;
+	     ((addr_ip >> 24) & 0xFF) <= vsg_entry->range;
+	     addr_ip += 0x01000000) {
+		if (vsg_entry->addr.ss_family == AF_INET6) {
+			((struct sockaddr_in6*)&vip_addr)->sin6_addr.s6_addr32[3] = addr_ip;
+		} else {
+			((struct sockaddr_in*)&vip_addr)->sin_addr.s_addr = addr_ip;
+		}
+		rs_aratio_action_addr(limit, vs, &vip_addr);
+	}
+
+	return 1;
+}
+static int rs_aratio_action_group (int limit, virtual_server_t *vs)
+{
+	virtual_server_group_t *vsg = ipvs_get_group_by_name(vs->vsgname, check_data->vs_group);
+	virtual_server_group_entry_t *vsg_entry;
+	list l;
+	element e;
+
+	if (!vsg) return IPVS_ERROR;
+
+	/* visit range list */
+	l = vsg->addr_range;
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+		vsg_entry = ELEMENT_DATA(e);
+		rs_aratio_action_group_range(limit, vs, vsg_entry);
+	}
+
+	return 1;
+}
+
+static int rs_aratio_action(int limit, virtual_server_t *vs)
+{
+    if (vs->vsgname) {
+        rs_aratio_action_group(limit, vs);
+    } else {
+        rs_aratio_action_addr(limit, vs, &(vs->addr));
+    }
+
+    return 1;
+}
+
+static int rs_aratio_reach_upper_limit(thread_ref_t arg) {
+	virtual_server_t * vs = THREAD_ARG(arg);
+	int rs_alive_ratio = 0;
+
+	vs->rs_upper_limit_thread = NULL;
+	rs_alive_ratio = vs->rs_alive_count*100/LIST_SIZE(vs->rs);
+	if (rs_alive_ratio >= vs->rs_aratio_upper_limit) {
+		log_message(LOG_INFO, "VS [%s] rs_alive_ratio (%d%%) >= rs_aratio_upper_limit (%d%%) execute action",
+				(vs->vsgname) ? vs->vsgname : FMT_VS(vs)
+				, rs_alive_ratio
+				, vs->rs_aratio_upper_limit);
+		vs->flag &= ~RS_ARATIO_REACH_LOWER_LIMIT;
+		rs_aratio_action(1, vs);
+	} else {
+		log_message(LOG_ERR, "VS [%s] rs_alive_ratio (%d%%) < rs_aratio_upper_limit (%d%%) does not execute action",
+				(vs->vsgname) ? vs->vsgname : FMT_VS(vs)
+				, rs_alive_ratio
+				, vs->rs_aratio_upper_limit);
+	}
+
+	return 0;
+}
+
+static int vs_addr_cmp(struct sockaddr_storage *addr_a, struct sockaddr_storage *addr_b)
+{
+    int ret = 0;
+
+    if (addr_a->ss_family != addr_b->ss_family)
+        return 0;
+
+    if (addr_a->ss_family == AF_INET6) {
+        ret = inaddr_equal(AF_INET6, &((struct sockaddr_in6 *)addr_a)->sin6_addr,
+            &((struct sockaddr_in6 *)addr_b)->sin6_addr);
+    } else {
+        ret = inaddr_equal(AF_INET, &((struct sockaddr_in *)addr_a)->sin_addr,
+            &((struct sockaddr_in *)addr_b)->sin_addr);
+    }
+
+    return ret;
+}
+
+static int __vs_group_rang_addr_cmp(struct sockaddr_storage *addr,
+										virtual_server_group_entry_t *vsg_entry)
+{
+	uint32_t addr_ip, ip;
+	struct sockaddr_storage vip_addr;
+	int ret = 0;
+
+	vip_addr = vsg_entry->addr;
+	if (vsg_entry->addr.ss_family == AF_INET6) {
+		//inet_sockaddrip6(&vsg_entry->addr, &addr.in6);
+		ip = ((struct sockaddr_in6*)&vip_addr)->sin6_addr.s6_addr32[3];
+	} else {
+		ip = ((struct sockaddr_in*)&vip_addr)->sin_addr.s_addr;
+	}
+
+	/* Parse the whole range */
+	for (addr_ip = ip;
+	     ((addr_ip >> 24) & 0xFF) <= vsg_entry->range;
+	     addr_ip += 0x01000000) {
+		if (vsg_entry->addr.ss_family == AF_INET6) {
+			((struct sockaddr_in6*)&vip_addr)->sin6_addr.s6_addr32[3] = addr_ip;
+		} else {
+			((struct sockaddr_in*)&vip_addr)->sin_addr.s_addr = addr_ip;
+		}
+
+		ret |= vs_addr_cmp(addr, &vip_addr);
+	}
+	return ret;
+
+}
+
+static int __vs_group_addr_cmp(struct sockaddr_storage *addr, virtual_server_group_t *vsg)
+{
+	virtual_server_group_entry_t *vsg_entry = NULL;
+	list l;
+	element e;
+	int ret = 0;
+
+	/* visit addr_ip list */
+	l = vsg->addr_ip;
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+		vsg_entry = ELEMENT_DATA(e);
+		ret |= vs_addr_cmp(addr, &vsg_entry->addr);
+	}
+
+	/* visit range list */
+	l = vsg->addr_range;
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+		vsg_entry = ELEMENT_DATA(e);
+		ret |= __vs_group_rang_addr_cmp(addr, vsg_entry);
+	}
+
+    return ret;
+}
+
+static int __vs_group_rang_cmp(virtual_server_group_entry_t *vsg_entry,
+                                        virtual_server_group_t *vsg)
+{
+	uint32_t addr_ip, ip;
+	struct sockaddr_storage vip_addr;
+	int ret = 0;
+
+	vip_addr = vsg_entry->addr;
+	if (vsg_entry->addr.ss_family == AF_INET6) {
+		//inet_sockaddrip6(&vsg_entry->addr, &addr.in6);
+		ip = ((struct sockaddr_in6*)&vip_addr)->sin6_addr.s6_addr32[3];
+	} else {
+		ip = ((struct sockaddr_in*)&vip_addr)->sin_addr.s_addr;
+	}
+
+	/* Parse the whole range */
+	for (addr_ip = ip;
+	     ((addr_ip >> 24) & 0xFF) <= vsg_entry->range;
+	     addr_ip += 0x01000000) {
+		if (vsg_entry->addr.ss_family == AF_INET6) {
+			((struct sockaddr_in6*)&vip_addr)->sin6_addr.s6_addr32[3] = addr_ip;
+		} else {
+			((struct sockaddr_in*)&vip_addr)->sin_addr.s_addr = addr_ip;
+		}
+		ret |= __vs_group_addr_cmp(&vip_addr, vsg);
+	}
+	return ret;
+}
+
+static int vs_group_addr_cmp(virtual_server_t *vs_a, virtual_server_t *vs_b)
+{
+    virtual_server_group_t *vsg_a = ipvs_get_group_by_name(vs_a->vsgname, check_data->vs_group);
+    virtual_server_group_t *vsg_b = ipvs_get_group_by_name(vs_b->vsgname, check_data->vs_group);
+    virtual_server_group_entry_t *vsg_entry;
+    list l;
+    element e;
+    int ret = 0;
+
+    if (vsg_a == NULL || vsg_b == NULL)
+        return 0;
+
+    if (vsg_a == vsg_b)
+        return 1;
+
+	/* visit addr_ip list */
+	l = vsg_a->addr_ip;
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+        vsg_entry = ELEMENT_DATA(e);
+        ret |= __vs_group_addr_cmp(&vsg_entry->addr, vsg_b);
+	}
+
+	/* visit range list */
+	l = vsg_a->addr_range;
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+        vsg_entry = ELEMENT_DATA(e);
+        ret |= __vs_group_rang_cmp(vsg_entry, vsg_b);
+	}
+
+    return ret;
+}
+
+static int all_vs_rs_aratio_reach_lower_limit(virtual_server_t *var_vs)
+{
+    element e;
+    virtual_server_t *tmp_vs = NULL;
+    virtual_server_group_t *vsg = NULL;
+    list l;
+    int ret = 0;
+
+	if (NULL == check_data) {
+		return 1;
+	}
+
+	l = check_data->vs;
+
+	if (LIST_ISEMPTY(l)) {
+		return 1;
+	}
+
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+		tmp_vs = ELEMENT_DATA(e);
+        if (tmp_vs->flag & RS_ARATIO_REACH_LOWER_LIMIT)
+            continue;
+
+        if (var_vs->vsgname && tmp_vs->vsgname) {
+            ret = vs_group_addr_cmp(var_vs, tmp_vs);
+        } else if (var_vs->vsgname && NULL == tmp_vs->vsgname) {
+            vsg = ipvs_get_group_by_name(var_vs->vsgname, check_data->vs_group);
+            ret = __vs_group_addr_cmp(&tmp_vs->addr, vsg);
+        } else if (NULL == var_vs->vsgname && tmp_vs->vsgname) {
+            vsg = ipvs_get_group_by_name(tmp_vs->vsgname, check_data->vs_group);
+            ret = __vs_group_addr_cmp(&var_vs->addr, vsg);
+        } else {
+            ret = vs_addr_cmp(&var_vs->addr, &tmp_vs->addr);
+        }
+
+        if (ret) {
+            log_message(LOG_INFO, "VS [%s] does not reach lower limit, rs_alive_ratio_upper_limit (%d%%)",
+            (tmp_vs->vsgname) ? tmp_vs->vsgname : FMT_VS(tmp_vs)
+            , tmp_vs->rs_aratio_upper_limit);
+            return 0;
+        }
+	}
+	return 1;
+}
+
+static void vs_rs_aratio_state(bool alive, virtual_server_t * vs)
+{
+	int rs_alive_ratio = 0;
+
+    if (alive) {
+		vs->rs_alive_count++;
+		rs_alive_ratio = vs->rs_alive_count*100/LIST_SIZE(vs->rs);
+		if (rs_alive_ratio >= vs->rs_aratio_upper_limit && vs->flag & RS_ARATIO_REACH_LOWER_LIMIT) {
+				log_message(LOG_INFO, "VS [%s] rs_alive_ratio (%d%%) >= rs_alive_ratio_upper_limit (%d%%)",
+				(vs->vsgname) ? vs->vsgname : FMT_VS(vs)
+				, rs_alive_ratio
+				, vs->rs_aratio_upper_limit);
+		if (NULL == vs->rs_upper_limit_thread) {
+				vs->rs_upper_limit_thread = thread_add_timer(master, rs_aratio_reach_upper_limit, vs, TIMER_HZ);
+		} else {
+				/* be here ONLY if rs_alive_ratio_up < 100%*/
+				log_message(LOG_INFO, "Timer already added, ignore..");
+		    }
+		}
+    } else {
+		vs->rs_alive_count--;
+		rs_alive_ratio = vs->rs_alive_count*100/LIST_SIZE(vs->rs);
+		if (rs_alive_ratio <= vs->rs_aratio_lower_limit) {
+			log_message(LOG_INFO, "VS [%s] rs_alive_ratio (%d%%) <= rs_aratio_lower_limit (%d%%)",
+					(vs->vsgname) ? vs->vsgname : FMT_VS(vs)
+					, rs_alive_ratio
+					, vs->rs_aratio_lower_limit);
+
+			vs->flag |= RS_ARATIO_REACH_LOWER_LIMIT;
+			if (all_vs_rs_aratio_reach_lower_limit(vs)) {
+				if (vs->rs_aratio_action) {
+					rs_aratio_action(0, vs);
+				}
+			}
+		}
+
+		if (rs_alive_ratio < vs->rs_aratio_upper_limit) {
+			/* rs down again, so remove old timer */
+			if (NULL != vs->rs_upper_limit_thread) {
+				log_message(LOG_INFO, "VS [%s] rs_alive_ratio (%d%%) < rs_aratio_upper_limit (%d%%)",
+						(vs->vsgname) ? vs->vsgname : FMT_VS(vs)
+						, rs_alive_ratio
+						, vs->rs_aratio_upper_limit);
+				thread_cancel(vs->rs_upper_limit_thread);
+				vs->rs_upper_limit_thread = NULL;
+			}
+		}
+    }
+}
+
 /* manipulate add/remove rs according to alive state */
 static bool
 perform_svr_state(bool alive, checker_t *checker)
@@ -578,6 +933,7 @@ perform_svr_state(bool alive, checker_t *checker)
 
 	virtual_server_t * vs = checker->vs;
 	real_server_t * rs = checker->rs;
+	int rs_alive_ratio = 0;
 
 	if (ISALIVE(rs) == alive)
 		return true;
@@ -595,6 +951,7 @@ perform_svr_state(bool alive, checker_t *checker)
 	}
 	rs->alive = alive;
 	do_rs_notifies(vs, rs, false);
+	vs_rs_aratio_state(alive, vs);
 
 	/* We may have changed quorum state. If the quorum wasn't up
 	 * but is now up, this is where the rs is added. */

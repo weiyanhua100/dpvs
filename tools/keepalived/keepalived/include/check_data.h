@@ -42,10 +42,16 @@
 #include "vector.h"
 #include "notify.h"
 #include "utils.h"
+#include "scheduler.h"
 
 /* Daemon dynamic data structure definition */
 #define KEEPALIVED_DEFAULT_DELAY	(60 * TIMER_HZ)
 #define TNLKINDSIZ 			16
+
+#define DEFAULT_RS_ARATIO_UPPER_LIMIT 100
+#define DEFAULT_RS_ARATIO_LOWER_LIMIT 0
+#define RS_ARATIO_REACH_LOWER_LIMIT (0x01)
+
 /* SSL specific data */
 typedef struct _ssl_data {
 	int				enable;
@@ -243,6 +249,12 @@ typedef struct _virtual_server {
 	char 	oifname[IFNAMSIZ];
 	unsigned hash_target;
 	unsigned syn_proxy;
+	int				rs_alive_count;
+	int				rs_aratio_lower_limit;
+	int				rs_aratio_upper_limit;
+	int				flag;
+	char				*rs_aratio_action;
+	thread_ref_t			rs_upper_limit_thread;
 	char 	*local_addr_gname; 	/*local ip address group name*/
 	char 	*blklst_addr_gname; 	/*black list ip group name*/	
 	char 	*vip_bind_dev; 		/*the interface name, vip bindto*/

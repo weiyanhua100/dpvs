@@ -264,6 +264,7 @@ free_vs(void *data)
 	FREE_PTR(vs->local_addr_gname);
 	FREE_PTR(vs->blklst_addr_gname);
 	FREE_PTR(vs->vip_bind_dev);
+	FREE_PTR(vs->rs_aratio_action);
 	FREE(vs);
 }
 
@@ -446,6 +447,12 @@ dump_vs(FILE *fp, const void *data)
 		break;
 	}
 
+	if (vs->rs_aratio_action) {
+		log_message(LOG_INFO, "   rs_aratio_action = %s", vs->rs_aratio_action);
+		log_message(LOG_INFO, "   rs_aratio_lower_limit = %d", vs->rs_aratio_lower_limit);
+		log_message(LOG_INFO, "   rs_aratio_upper_limit = %d", vs->rs_aratio_upper_limit);
+	}
+
 	conf_write(fp, "   alive = %d", vs->alive);
 	conf_write(fp, "   quorum_state_up = %d", vs->quorum_state_up);
 	conf_write(fp, "   reloaded = %d", vs->reloaded);
@@ -524,6 +531,11 @@ alloc_vs(const char *param1, const char *param2)
 	new->blklst_addr_gname = NULL;
 	new->vip_bind_dev = NULL;
 	new->hash_target = 0;
+	new->rs_alive_count = 0;
+	new->rs_aratio_lower_limit = 0;
+	new->rs_aratio_upper_limit = 0;
+	new->rs_aratio_action = NULL;
+	new->rs_upper_limit_thread = NULL;
 	new->af = 0;
 	new->bps = 0;
 	new->limit_proportion = 100;
@@ -848,6 +860,7 @@ alloc_rs(const char *ip, const char *port)
 	if (!LIST_EXISTS(vs->rs))
 		vs->rs = alloc_list(free_rs, dump_rs);
 	list_add(vs->rs, new);
+	vs->rs_alive_count++;
 
 	clear_dynamic_misc_check_flag();
 }
