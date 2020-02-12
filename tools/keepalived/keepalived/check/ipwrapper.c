@@ -327,6 +327,186 @@ perform_quorum_state(virtual_server_t *vs, int add)
 	}
 }
 
+static int vs_addr_cmp(struct sockaddr_storage *addr_a, struct sockaddr_storage *addr_b)
+{
+    int ret = 0;
+
+    if (addr_a->ss_family != addr_b->ss_family)
+        return 0;
+
+    if (addr_a->ss_family == AF_INET6) {
+        ret = inaddr_equal(AF_INET6, &((struct sockaddr_in6 *)addr_a)->sin6_addr,
+            &((struct sockaddr_in6 *)addr_b)->sin6_addr);
+    } else {
+        ret = inaddr_equal(AF_INET, &((struct sockaddr_in *)addr_a)->sin_addr,
+            &((struct sockaddr_in *)addr_b)->sin_addr);
+    }
+
+    return ret;
+}
+
+static int __vs_group_rang_addr_cmp(struct sockaddr_storage *addr,
+										virtual_server_group_entry_t *vsg_entry)
+{
+	uint32_t addr_ip, ip;
+	struct sockaddr_storage vip_addr;
+	int ret = 0;
+
+	vip_addr = vsg_entry->addr;
+	if (vsg_entry->addr.ss_family == AF_INET6) {
+		//inet_sockaddrip6(&vsg_entry->addr, &addr.in6);
+		ip = ((struct sockaddr_in6*)&vip_addr)->sin6_addr.s6_addr32[3];
+	} else {
+		ip = ((struct sockaddr_in*)&vip_addr)->sin_addr.s_addr;
+	}
+
+	/* Parse the whole range */
+	for (addr_ip = ip;
+	     ((addr_ip >> 24) & 0xFF) <= vsg_entry->range;
+	     addr_ip += 0x01000000) {
+		if (vsg_entry->addr.ss_family == AF_INET6) {
+			((struct sockaddr_in6*)&vip_addr)->sin6_addr.s6_addr32[3] = addr_ip;
+		} else {
+			((struct sockaddr_in*)&vip_addr)->sin_addr.s_addr = addr_ip;
+		}
+
+		ret |= vs_addr_cmp(addr, &vip_addr);
+	}
+	return ret;
+
+}
+
+static int __vs_group_addr_cmp(struct sockaddr_storage *addr, virtual_server_group_t *vsg)
+{
+	virtual_server_group_entry_t *vsg_entry = NULL;
+	list l;
+	element e;
+	int ret = 0;
+
+	/* visit addr_ip list */
+	l = vsg->addr_ip;
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+		vsg_entry = ELEMENT_DATA(e);
+		ret |= vs_addr_cmp(addr, &vsg_entry->addr);
+	}
+
+	/* visit range list */
+	l = vsg->range;
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+		vsg_entry = ELEMENT_DATA(e);
+		ret |= __vs_group_rang_addr_cmp(addr, vsg_entry);
+	}
+
+    return ret;
+}
+
+static int __vs_group_rang_cmp(virtual_server_group_entry_t *vsg_entry,
+                                        virtual_server_group_t *vsg)
+{
+	uint32_t addr_ip, ip;
+	struct sockaddr_storage vip_addr;
+	int ret = 0;
+
+	vip_addr = vsg_entry->addr;
+	if (vsg_entry->addr.ss_family == AF_INET6) {
+		//inet_sockaddrip6(&vsg_entry->addr, &addr.in6);
+		ip = ((struct sockaddr_in6*)&vip_addr)->sin6_addr.s6_addr32[3];
+	} else {
+		ip = ((struct sockaddr_in*)&vip_addr)->sin_addr.s_addr;
+	}
+
+	/* Parse the whole range */
+	for (addr_ip = ip;
+	     ((addr_ip >> 24) & 0xFF) <= vsg_entry->range;
+	     addr_ip += 0x01000000) {
+		if (vsg_entry->addr.ss_family == AF_INET6) {
+			((struct sockaddr_in6*)&vip_addr)->sin6_addr.s6_addr32[3] = addr_ip;
+		} else {
+			((struct sockaddr_in*)&vip_addr)->sin_addr.s_addr = addr_ip;
+		}
+		ret |= __vs_group_addr_cmp(&vip_addr, vsg);
+	}
+	return ret;
+}
+
+static int vs_group_addr_cmp(virtual_server_t *vs_a, virtual_server_t *vs_b)
+{
+    virtual_server_group_t *vsg_a = ipvs_get_group_by_name(vs_a->vsgname, check_data->vs_group);
+    virtual_server_group_t *vsg_b = ipvs_get_group_by_name(vs_b->vsgname, check_data->vs_group);
+    virtual_server_group_entry_t *vsg_entry;
+    list l;
+    element e;
+    int ret = 0;
+
+    if (vsg_a == NULL || vsg_b == NULL)
+        return 0;
+
+    if (vsg_a == vsg_b)
+        return 1;
+
+	/* visit addr_ip list */
+	l = vsg_a->addr_ip;
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+        vsg_entry = ELEMENT_DATA(e);
+        ret |= __vs_group_addr_cmp(&vsg_entry->addr, vsg_b);
+	}
+
+	/* visit range list */
+	l = vsg_a->range;
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+        vsg_entry = ELEMENT_DATA(e);
+        ret |= __vs_group_rang_cmp(vsg_entry, vsg_b);
+	}
+
+    return ret;
+}
+
+static int all_vs_quorum_down(virtual_server_t *var_vs)
+{
+    element e;
+    virtual_server_t *tmp_vs = NULL;
+    virtual_server_group_t *vsg = NULL;
+    list l;
+    int ret = 0;
+
+	if (NULL == check_data) {
+		return 1;
+	}
+
+	l = check_data->vs;
+
+	if (LIST_ISEMPTY(l)) {
+		return 1;
+	}
+
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+		tmp_vs = ELEMENT_DATA(e);
+        if (tmp_vs->quorum_state == DOWN)
+            continue;
+
+        if (var_vs->vsgname && tmp_vs->vsgname) {
+            ret = vs_group_addr_cmp(var_vs, tmp_vs);
+        } else if (var_vs->vsgname && NULL == tmp_vs->vsgname) {
+            vsg = ipvs_get_group_by_name(var_vs->vsgname, check_data->vs_group);
+            ret = __vs_group_addr_cmp(&tmp_vs->addr, vsg);
+        } else if (NULL == var_vs->vsgname && tmp_vs->vsgname) {
+            vsg = ipvs_get_group_by_name(tmp_vs->vsgname, check_data->vs_group);
+            ret = __vs_group_addr_cmp(&var_vs->addr, vsg);
+        } else {
+            ret = vs_addr_cmp(&var_vs->addr, &tmp_vs->addr);
+        }
+
+        if (ret) {
+            log_message(LOG_INFO, "VS [%s] have the same vip with VS [%s], and the quorum_state is UP",
+            (tmp_vs->vsgname) ? tmp_vs->vsgname : FMT_VS(tmp_vs)
+            ,(var_vs->vsgname) ? var_vs->vsgname : FMT_VS(var_vs));
+            return 0;
+        }
+	}
+	return 1;
+}
+
+
 /* set quorum state depending on current weight of real servers */
 static void
 update_quorum_state(virtual_server_t * vs)
@@ -381,7 +561,7 @@ update_quorum_state(virtual_server_t * vs)
 				    , vs->quorum - vs->hysteresis
 				    , weight_sum
 				    , FMT_VS(vs));
-		if (vs->quorum_down) {
+		if (vs->quorum_down && all_vs_quorum_down(vs)) {
 			log_message(LOG_INFO, "Executing [%s] for VS %s"
 					    , vs->quorum_down
 					    , FMT_VS(vs));
