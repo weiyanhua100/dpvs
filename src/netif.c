@@ -43,6 +43,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ipvs/redirect.h>
+#ifdef CONFIG_ICMP_FWD_CORE
+#include "icmp.h"
+#endif
 
 #define NETIF_PKTPOOL_NB_MBUF_DEF   65535
 #define NETIF_PKTPOOL_NB_MBUF_MIN   1023
@@ -144,7 +147,6 @@ static struct list_head port_ntab[NETIF_PORT_TABLE_BUCKETS]; /* hashed by name *
 #define NETIF_CTRL_BUFFER_LEN     4096
 
 /* function declarations */
-static void kni_ingress(struct rte_mbuf *mbuf, struct netif_port *dev);
 static void kni_lcore_loop(void *dummy);
 
 
@@ -709,6 +711,18 @@ static void cpu_id_handler(vector_t tokens)
     FREE_PTR(str);
 }
 
+#ifdef CONFIG_ICMP_FWD_CORE
+static void cpu_icmp_fwd_handler(vector_t tokens)
+{
+    struct worker_conf_stream *current_worker = list_entry(worker_list.next,
+            struct worker_conf_stream, worker_list_node);
+
+    RTE_LOG(INFO, NETIF, "%s(%d) used to forward icmp\n",
+        current_worker->name, current_worker->cpu_id);
+    g_icmp_fwd_lcore_id = current_worker->cpu_id;
+}
+#endif
+
 static void worker_port_handler(vector_t tokens)
 {
     assert(VECTOR_SIZE(tokens) >= 1);
@@ -892,6 +906,9 @@ void install_netif_keywords(void)
     install_sublevel();
     install_keyword("type", worker_type_handler, KW_TYPE_INIT);
     install_keyword("cpu_id", cpu_id_handler, KW_TYPE_INIT);
+#ifdef CONFIG_ICMP_FWD_CORE
+    install_keyword("icmp_fwd_core", cpu_icmp_fwd_handler, KW_TYPE_INIT);
+#endif
     install_keyword("port", worker_port_handler, KW_TYPE_INIT);
     install_sublevel();
     install_keyword("rx_queue_ids", rx_queue_ids_handler, KW_TYPE_INIT);
@@ -2531,7 +2548,11 @@ static void lcore_job_timer_manage(void *args)
     }
 }
 
+#ifdef CONFIG_ICMP_FWD_CORE
+#define NETIF_JOB_MAX   7
+#else
 #define NETIF_JOB_MAX   6
+#endif
 
 static struct dpvs_lcore_job_array netif_jobs[NETIF_JOB_MAX] = {
     [0] = {
@@ -2613,6 +2634,14 @@ static void netif_lcore_init(void)
                             LCORE_JOB_LOOP, kni_lcore_loop, 0);
     }
 
+#ifdef CONFIG_ICMP_FWD_CORE
+    netif_jobs[6].role = LCORE_ROLE_FWD_WORKER;
+    snprintf(netif_jobs[6].job.name, sizeof(netif_jobs[4].job.name) - 1, "%s", "icmp_forward_proc");
+    netif_jobs[6].job.func = icmp_forward_proc;
+    netif_jobs[6].job.data = NULL;
+    netif_jobs[6].job.type = LCORE_JOB_LOOP;
+#endif
+
     for (i = 0; i < NELEMS(netif_jobs); i++) {
         res = dpvs_lcore_job_register(&netif_jobs[i].job, netif_jobs[i].role);
         if (res < 0) {
@@ -2665,7 +2694,7 @@ static inline void free_mbufs(struct rte_mbuf **pkts, unsigned num)
     }
 }
 
-static void kni_ingress(struct rte_mbuf *mbuf, struct netif_port *dev)
+void kni_ingress(struct rte_mbuf *mbuf, struct netif_port *dev)
 {
     if (!kni_dev_exist(dev))
         goto freepkt;
